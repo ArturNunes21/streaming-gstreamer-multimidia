@@ -1,5 +1,8 @@
 # Streaming de áudio RTP/UDP com GStreamer
 
+> Documentação da atividade de **áudio**. O `compilar.ps1` e o `Makefile` agora compilam também
+> as interfaces de vídeo, por isso exigem as dependências do [README.md](README.md).
+
 Atividade prática de **Sistemas Multimídia (CMP 1103)**: aplicação em C com GStreamer para
 transmitir e receber áudio pela rede, com controle de jitter/latência e diagnóstico de perda
 de pacotes.
@@ -151,8 +154,8 @@ Parte B — rede ruim simulada (2% de perda, até 80 ms de atraso):
 | B3 | `./receptor.exe 5000 1000 teste_B3.csv teste_B3.wav` | `./transmissor.exe 127.0.0.1 5000 500 2 80` |
 
 Os resultados obtidos estão em `resultados/`, analisados em
-[REGISTRO_EXPERIMENTOS.md](REGISTRO_EXPERIMENTOS.md), com a conclusão em
-[CONCLUSAO.md](CONCLUSAO.md).
+[REGISTRO_EXPERIMENTOS_AUDIO.md](REGISTRO_EXPERIMENTOS_AUDIO.md), com a conclusão em
+[CONCLUSAO_AUDIO.md](CONCLUSAO_AUDIO.md).
 
 ---
 

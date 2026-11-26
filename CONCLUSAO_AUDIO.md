@@ -31,4 +31,4 @@ encapsulado em pacotes RTP (L16), enviado por UDP e reconstruído no receptor, q
   `num-duplicates`) foram suficientes para diagnosticar e comparar o comportamento das
   configurações, sem implementar um algoritmo próprio.
 
-Detalhes dos testes em [REGISTRO_EXPERIMENTOS.md](REGISTRO_EXPERIMENTOS.md).
+Detalhes dos testes em [REGISTRO_EXPERIMENTOS_AUDIO.md](REGISTRO_EXPERIMENTOS_AUDIO.md).
