@@ -1,246 +1,169 @@
-/* Interface grafica do transmissor (servidor de midia) - GTK 3.
- * Uso: servidor [--iniciar]   (--iniciar comeca a transmitir ao abrir) */
 #include <gtk/gtk.h>
 #include <gst/gst.h>
+#include <stdio.h>
+#include <stdlib.h>
 
-#include "midia.h"
+static GtkWidget *campo_ip, *campo_porta, *combo_resolucao, *combo_fps;
+static GtkWidget *campo_bitrate, *botao_iniciar, *botao_parar, *label_estado;
+static GstElement *pipeline = NULL;
+static guint id_bus = 0;
 
-typedef struct {
-    GtkWidget *ip, *porta, *resolucao, *fps, *bitrate, *preset, *perda;
-    GtkWidget *grade, *botao_iniciar, *botao_parar, *estado;
-    Midia *midia;
-    guint cronometro;
-    guint quadros_anteriores;
-    int fps_configurado;
-} Servidor;
-
-static void definir_estado(Servidor *s, const char *texto) {
-    gtk_label_set_text(GTK_LABEL(s->estado), texto);
-    g_print("[estado] %s\n", texto);
-}
-
-static void habilitar_controles(Servidor *s, gboolean transmitindo) {
-    gtk_widget_set_sensitive(s->grade, !transmitindo);
-    gtk_widget_set_sensitive(s->botao_iniciar, !transmitindo);
-    gtk_widget_set_sensitive(s->botao_parar, transmitindo);
-}
-
-static void encerrar(Servidor *s) {
-    if (s->cronometro) {
-        g_source_remove(s->cronometro);
-        s->cronometro = 0;
+static void parar_pipeline(void) {
+    if (pipeline) {
+        if (id_bus) g_source_remove(id_bus);
+        id_bus = 0;
+        gst_element_set_state(pipeline, GST_STATE_NULL);
+        gst_object_unref(pipeline);
+        pipeline = NULL;
     }
-    midia_destruir(s->midia);
-    s->midia = NULL;
+    gtk_widget_set_sensitive(botao_iniciar, TRUE);
+    gtk_widget_set_sensitive(botao_parar, FALSE);
 }
 
-static gboolean encerrar_depois(gpointer dados) {
-    Servidor *s = dados;
-    encerrar(s);
-    habilitar_controles(s, FALSE);
-    return G_SOURCE_REMOVE;
-}
-
-static gboolean atualizar_estado(gpointer dados) {
-    Servidor *s = dados;
-    MidiaEstatisticas est;
-    midia_obter_estatisticas(s->midia, &est);
-
-    guint no_ultimo_segundo = est.quadros - s->quadros_anteriores;
-    s->quadros_anteriores = est.quadros;
-
-    gchar *texto = g_strdup_printf(
-        "Transmitindo: %u quadros/s codificados (configurado: %d), total %u",
-        no_ultimo_segundo, s->fps_configurado, est.quadros);
-    definir_estado(s, texto);
-    g_free(texto);
-    return G_SOURCE_CONTINUE;
-}
-
-static void ao_evento(MidiaEvento evento, const char *texto, gpointer dados) {
-    Servidor *s = dados;
-    if (evento == MIDIA_EVENTO_ERRO) {
-        gchar *msg = g_strdup_printf("Erro: %s", texto);
-        definir_estado(s, msg);
-        g_free(msg);
-        if (s->cronometro) {
-            g_source_remove(s->cronometro);
-            s->cronometro = 0;
-        }
-        /* Nao destruir a pipeline de dentro do watch do proprio bus. */
-        g_idle_add(encerrar_depois, s);
-    } else if (evento == MIDIA_EVENTO_ESTADO) {
-        g_print("[pipeline] %s\n", texto);
+static gboolean bus_call(GstBus *bus, GstMessage *msg, gpointer data) {
+    if (GST_MESSAGE_TYPE(msg) == GST_MESSAGE_ERROR) {
+        GError *err;
+        gst_message_parse_error(msg, &err, NULL);
+        g_printerr("ERRO: %s\n", err->message);
+        gtk_label_set_text(GTK_LABEL(label_estado), err->message);
+        g_error_free(err);
+        parar_pipeline();
+    } else if (GST_MESSAGE_TYPE(msg) == GST_MESSAGE_STATE_CHANGED &&
+               GST_MESSAGE_SRC(msg) == GST_OBJECT(pipeline)) {
+        GstState novo;
+        gst_message_parse_state_changed(msg, NULL, &novo, NULL);
+        if (novo == GST_STATE_PLAYING)
+            gtk_label_set_text(GTK_LABEL(label_estado), "Transmitindo");
     }
+    return TRUE;
 }
 
 static void iniciar_transmissao(GtkButton *botao, gpointer dados) {
-    (void) botao;
-    Servidor *s = dados;
-    if (s->midia) return;
+    const char *ip = gtk_entry_get_text(GTK_ENTRY(campo_ip));
+    int porta = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(campo_porta));
+    int bitrate = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(campo_bitrate));
+    const char *resolucao = gtk_combo_box_get_active_id(GTK_COMBO_BOX(combo_resolucao));
+    int fps = atoi(gtk_combo_box_get_active_id(GTK_COMBO_BOX(combo_fps)));
+    int largura, altura;
 
-    /* Recuperar e validar os valores da interface. */
-    gchar *ip = g_strstrip(g_strdup(gtk_entry_get_text(GTK_ENTRY(s->ip))));
-    if (!midia_validar_ip(ip)) {
-        definir_estado(s, "Endereco IP invalido (exemplo: 127.0.0.1)");
-        gtk_widget_grab_focus(s->ip);
-        g_free(ip);
+    if (!g_hostname_is_ip_address(ip)) {
+        gtk_label_set_text(GTK_LABEL(label_estado), "IP invalido");
         return;
     }
+    sscanf(resolucao, "%dx%d", &largura, &altura);
 
-    ConfigTransmissor cfg = {0};
-    cfg.host = ip;
-    gtk_spin_button_update(GTK_SPIN_BUTTON(s->porta));
-    cfg.porta = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(s->porta));
-
-    const char *res = gtk_combo_box_get_active_id(GTK_COMBO_BOX(s->resolucao));
-    const char *fps = gtk_combo_box_get_active_id(GTK_COMBO_BOX(s->fps));
-    const char *preset = gtk_combo_box_get_active_id(GTK_COMBO_BOX(s->preset));
-    if (!res || !fps || !preset ||
-        sscanf(res, "%dx%d", &cfg.largura, &cfg.altura) != 2) {
-        definir_estado(s, "Selecione resolucao, FPS e preset");
-        g_free(ip);
-        return;
-    }
-    cfg.fps = atoi(fps);
-    cfg.speed_preset = preset;
-    gtk_spin_button_update(GTK_SPIN_BUTTON(s->bitrate));
-    cfg.bitrate_kbps =
-        gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(s->bitrate));
-    gtk_spin_button_update(GTK_SPIN_BUTTON(s->perda));
-    cfg.perda_pct = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(s->perda));
-
-    if (cfg.perda_pct > 0 && !midia_elemento_disponivel("netsim")) {
-        definir_estado(s, "netsim indisponivel: use perda simulada = 0");
-        g_free(ip);
-        return;
-    }
-
-    /* Configurar e iniciar a pipeline. */
     GError *erro = NULL;
-    s->midia = midia_criar_transmissor(&cfg, ao_evento, s, &erro);
-    g_free(ip);
-
-    if (s->midia == NULL || !midia_iniciar(s->midia, &erro)) {
-        gchar *msg = g_strdup_printf("Erro ao iniciar: %s",
-                                     erro ? erro->message : "desconhecido");
-        definir_estado(s, msg);
-        g_free(msg);
-        g_clear_error(&erro);
-        encerrar(s);
+    pipeline = gst_parse_launch(
+        "videotestsrc is-live=true pattern=ball ! capsfilter name=filtro ! "
+        "videoconvert ! video/x-raw,format=I420 ! "
+        "x264enc name=encoder tune=zerolatency speed-preset=ultrafast ! "
+        "h264parse config-interval=-1 ! mpegtsmux alignment=7 ! "
+        "udpsink name=saida sync=false", &erro);
+    if (erro) {
+        gtk_label_set_text(GTK_LABEL(label_estado), erro->message);
+        g_error_free(erro);
+        if (pipeline) gst_object_unref(pipeline);
+        pipeline = NULL;
         return;
     }
 
-    s->fps_configurado = cfg.fps;
-    s->quadros_anteriores = 0;
-    s->cronometro = g_timeout_add(1000, atualizar_estado, s);
-    habilitar_controles(s, TRUE);
-    definir_estado(s, "Iniciando transmissao...");
+    GstElement *filtro = gst_bin_get_by_name(GST_BIN(pipeline), "filtro");
+    GstElement *encoder = gst_bin_get_by_name(GST_BIN(pipeline), "encoder");
+    GstElement *saida = gst_bin_get_by_name(GST_BIN(pipeline), "saida");
+    GstCaps *caps = gst_caps_new_simple("video/x-raw",
+        "width", G_TYPE_INT, largura, "height", G_TYPE_INT, altura,
+        "framerate", GST_TYPE_FRACTION, fps, 1, NULL);
+
+    g_object_set(filtro, "caps", caps, NULL);
+    g_object_set(encoder, "bitrate", bitrate, "key-int-max", fps, NULL);
+    g_object_set(saida, "host", ip, "port", porta, NULL);
+
+    gst_caps_unref(caps);
+    gst_object_unref(filtro);
+    gst_object_unref(encoder);
+    gst_object_unref(saida);
+
+    GstBus *bus = gst_element_get_bus(pipeline);
+    id_bus = gst_bus_add_watch(bus, bus_call, NULL);
+    gst_object_unref(bus);
+
+    gtk_widget_set_sensitive(botao_iniciar, FALSE);
+    gtk_widget_set_sensitive(botao_parar, TRUE);
+    gtk_label_set_text(GTK_LABEL(label_estado), "Iniciando...");
+
+    if (gst_element_set_state(pipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
+        gtk_label_set_text(GTK_LABEL(label_estado), "Erro ao iniciar a transmissao");
+        parar_pipeline();
+    }
 }
 
 static void interromper_transmissao(GtkButton *botao, gpointer dados) {
-    (void) botao;
-    Servidor *s = dados;
-    encerrar(s);
-    habilitar_controles(s, FALSE);
-    definir_estado(s, "Transmissao interrompida");
+    parar_pipeline();
+    gtk_label_set_text(GTK_LABEL(label_estado), "Parado");
 }
 
-static void ao_fechar(GtkWidget *janela, gpointer dados) {
-    (void) janela;
-    encerrar(dados);
-    gtk_main_quit();
+static void adicionar_campo(GtkWidget *caixa, const char *texto, GtkWidget *campo) {
+    gtk_box_pack_start(GTK_BOX(caixa), gtk_label_new(texto), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(caixa), campo, FALSE, FALSE, 0);
 }
 
-static void adicionar_linha(GtkWidget *grade, int linha, const char *rotulo,
-                            GtkWidget *controle) {
-    GtkWidget *label = gtk_label_new(rotulo);
-    gtk_widget_set_halign(label, GTK_ALIGN_START);
-    gtk_widget_set_hexpand(controle, TRUE);
-    gtk_grid_attach(GTK_GRID(grade), label, 0, linha, 1, 1);
-    gtk_grid_attach(GTK_GRID(grade), controle, 1, linha, 1, 1);
-}
-
-static GtkWidget *criar_combo(const char *const *itens, const char *padrao) {
+static GtkWidget *criar_combo(const char *a, const char *b, const char *c) {
     GtkWidget *combo = gtk_combo_box_text_new();
-    for (int i = 0; itens[i]; i++)
-        gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(combo), itens[i], itens[i]);
-    gtk_combo_box_set_active_id(GTK_COMBO_BOX(combo), padrao);
+    gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(combo), a, a);
+    gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(combo), b, b);
+    gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(combo), c, c);
+    gtk_combo_box_set_active_id(GTK_COMBO_BOX(combo), b);
     return combo;
-}
-
-static GtkWidget *criar_numero(int minimo, int maximo, int passo, int valor) {
-    GtkWidget *spin = gtk_spin_button_new_with_range(minimo, maximo, passo);
-    gtk_spin_button_set_numeric(GTK_SPIN_BUTTON(spin), TRUE);
-    gtk_spin_button_set_value(GTK_SPIN_BUTTON(spin), valor);
-    return spin;
 }
 
 int main(int argc, char *argv[]) {
     gst_init(&argc, &argv);
     gtk_init(&argc, &argv);
 
-    static const char *resolucoes[] = {"320x240", "640x360", "1280x720", NULL};
-    static const char *taxas[] = {"15", "25", "30", NULL};
-    static const char *presets[] = {"ultrafast", "fast", "medium", NULL};
-
-    Servidor s = {0};
-
     GtkWidget *janela = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_set_title(GTK_WINDOW(janela), "Servidor Multimidia");
-    gtk_window_set_default_size(GTK_WINDOW(janela), 480, 360);
-    gtk_container_set_border_width(GTK_CONTAINER(janela), 14);
-    g_signal_connect(janela, "destroy", G_CALLBACK(ao_fechar), &s);
+    gtk_window_set_default_size(GTK_WINDOW(janela), 400, 300);
+    gtk_container_set_border_width(GTK_CONTAINER(janela), 10);
+    g_signal_connect(janela, "destroy", G_CALLBACK(gtk_main_quit), NULL);
 
-    GtkWidget *caixa = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
+    GtkWidget *caixa = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
     gtk_container_add(GTK_CONTAINER(janela), caixa);
 
-    s.grade = gtk_grid_new();
-    gtk_grid_set_row_spacing(GTK_GRID(s.grade), 8);
-    gtk_grid_set_column_spacing(GTK_GRID(s.grade), 12);
-    gtk_box_pack_start(GTK_BOX(caixa), s.grade, FALSE, FALSE, 0);
+    campo_ip = gtk_entry_new();
+    gtk_entry_set_text(GTK_ENTRY(campo_ip), "127.0.0.1");
 
-    s.ip = gtk_entry_new();
-    gtk_entry_set_text(GTK_ENTRY(s.ip), "127.0.0.1");
-    s.porta = criar_numero(1, 65535, 1, 5000);
-    s.resolucao = criar_combo(resolucoes, "640x360");
-    s.fps = criar_combo(taxas, "25");
-    s.bitrate = criar_numero(100, 8000, 100, 500);
-    s.preset = criar_combo(presets, "ultrafast");
-    s.perda = criar_numero(0, 50, 1, 0);
+    campo_porta = gtk_spin_button_new_with_range(1, 65535, 1);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(campo_porta), 5000);
 
-    adicionar_linha(s.grade, 0, "IP de destino", s.ip);
-    adicionar_linha(s.grade, 1, "Porta UDP", s.porta);
-    adicionar_linha(s.grade, 2, "Resolucao", s.resolucao);
-    adicionar_linha(s.grade, 3, "Quadros por segundo", s.fps);
-    adicionar_linha(s.grade, 4, "Bitrate (kbps)", s.bitrate);
-    adicionar_linha(s.grade, 5, "Preset do x264", s.preset);
-    adicionar_linha(s.grade, 6, "Perda simulada (%)", s.perda);
+    combo_resolucao = criar_combo("320x240", "640x360", "1280x720");
+    combo_fps = criar_combo("15", "25", "30");
 
-    GtkWidget *botoes = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    gtk_box_set_homogeneous(GTK_BOX(botoes), TRUE);
-    s.botao_iniciar = gtk_button_new_with_label("Iniciar");
-    s.botao_parar = gtk_button_new_with_label("Interromper");
-    gtk_box_pack_start(GTK_BOX(botoes), s.botao_iniciar, TRUE, TRUE, 0);
-    gtk_box_pack_start(GTK_BOX(botoes), s.botao_parar, TRUE, TRUE, 0);
-    gtk_box_pack_start(GTK_BOX(caixa), botoes, FALSE, FALSE, 0);
+    campo_bitrate = gtk_spin_button_new_with_range(100, 5000, 100);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(campo_bitrate), 500);
 
-    s.estado = gtk_label_new("Parado");
-    gtk_label_set_line_wrap(GTK_LABEL(s.estado), TRUE);
-    gtk_label_set_max_width_chars(GTK_LABEL(s.estado), 50);
-    gtk_box_pack_start(GTK_BOX(caixa), s.estado, FALSE, FALSE, 0);
+    adicionar_campo(caixa, "IP de destino", campo_ip);
+    adicionar_campo(caixa, "Porta UDP", campo_porta);
+    adicionar_campo(caixa, "Resolucao", combo_resolucao);
+    adicionar_campo(caixa, "FPS", combo_fps);
+    adicionar_campo(caixa, "Bitrate (kbps)", campo_bitrate);
 
-    g_signal_connect(s.botao_iniciar, "clicked",
-                     G_CALLBACK(iniciar_transmissao), &s);
-    g_signal_connect(s.botao_parar, "clicked",
-                     G_CALLBACK(interromper_transmissao), &s);
+    botao_iniciar = gtk_button_new_with_label("Iniciar");
+    botao_parar = gtk_button_new_with_label("Interromper");
+    label_estado = gtk_label_new("Parado");
+    gtk_box_pack_start(GTK_BOX(caixa), botao_iniciar, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(caixa), botao_parar, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(caixa), label_estado, FALSE, FALSE, 0);
+    gtk_widget_set_sensitive(botao_parar, FALSE);
 
-    habilitar_controles(&s, FALSE);
+    g_signal_connect(botao_iniciar, "clicked", G_CALLBACK(iniciar_transmissao), NULL);
+    g_signal_connect(botao_parar, "clicked", G_CALLBACK(interromper_transmissao), NULL);
+
     gtk_widget_show_all(janela);
-
-    if (argc > 1 && g_strcmp0(argv[1], "--iniciar") == 0)
-        iniciar_transmissao(NULL, &s);
-
     gtk_main();
+
+    if (pipeline) {
+        gst_element_set_state(pipeline, GST_STATE_NULL);
+        gst_object_unref(pipeline);
+    }
     return 0;
 }

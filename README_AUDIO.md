@@ -1,6 +1,6 @@
 # Streaming de áudio RTP/UDP com GStreamer
 
-> Documentação da atividade de **áudio**. O `compilar.ps1` e o `Makefile` agora compilam também
+> Documentação da atividade de **áudio**. O `compilar.ps1` agora compila também
 > as interfaces de vídeo, por isso exigem as dependências do [README.md](README.md).
 
 Atividade prática de **Sistemas Multimídia (CMP 1103)**: aplicação em C com GStreamer para
